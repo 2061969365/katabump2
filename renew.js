@@ -266,62 +266,85 @@ async function attemptTurnstileCdp(page) {
 }
 
 /**
- * ALTCHA captcha bypass: finds the <altcha-widget> web component,
- * pierces its Shadow DOM, and clicks the "I'm not a robot" checkbox.
+ * ALTCHA captcha bypass using coordinate-based CDP click.
+ *
+ * ALTCHA uses a closed Shadow DOM, so widget.shadowRoot is null from JS.
+ * We get the bounding box of the <altcha-widget> host element (a normal DOM
+ * node) and use CDP to dispatch a native mouse click at the checkbox position.
  */
 async function attemptAltchaClick(page) {
     try {
-        const clicked = await page.evaluate(() => {
-            // ALTCHA renders as a custom element <altcha-widget> in the main DOM
-            const widget = document.querySelector('altcha-widget');
-            if (!widget) return false;
-            const sr = widget.shadowRoot;
-            if (!sr) return false;
-            const checkbox = sr.querySelector('input[type="checkbox"]');
-            if (!checkbox) return false;
-            // Don't re-click if already checked
-            if (checkbox.checked) return 'already';
-            checkbox.click();
+        // Check if already verified (state attr is exposed on the host element)
+        const alreadyDone = await page.evaluate(() => {
+            const w = document.querySelector('altcha-widget');
+            return w && w.getAttribute('state') === 'verified';
+        }).catch(() => false);
+        if (alreadyDone) {
+            console.log('   >> ALTCHA already verified.');
             return true;
+        }
+
+        // Get the bounding box of the altcha-widget host element
+        const altchaLocator = page.locator('altcha-widget').first();
+        const box = await altchaLocator.boundingBox().catch(() => null);
+
+        if (!box) {
+            console.log('   >> ALTCHA widget not found or has no bounding box.');
+            return false;
+        }
+
+        // The checkbox sits near the left edge, vertically centred.
+        // ALTCHA default layout puts the checkbox ~20px from the left.
+        const clickX = box.x + 20;
+        const clickY = box.y + (box.height / 2);
+
+        console.log(`   >> ALTCHA widget at (${box.x.toFixed(0)},${box.y.toFixed(0)}) size ${box.width.toFixed(0)}x${box.height.toFixed(0)}`);
+        console.log(`   >> CDP-clicking ALTCHA checkbox at (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
+
+        const client = await page.context().newCDPSession(page);
+        await client.send('Input.dispatchMouseEvent', {
+            type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1
         });
-        if (clicked === 'already') {
-            console.log('   >> ALTCHA checkbox already checked.');
-            return true;
-        }
-        if (clicked) {
-            console.log('   >> ALTCHA checkbox clicked via Shadow DOM.');
-            return true;
-        }
+        await new Promise(r => setTimeout(r, 60 + Math.random() * 80));
+        await client.send('Input.dispatchMouseEvent', {
+            type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1
+        });
+        await client.detach();
+
+        console.log('   >> ALTCHA CDP click dispatched.');
+        return true;
     } catch (e) {
-        // ignore
+        console.log('   >> ALTCHA click error:', e.message);
     }
     return false;
 }
 
 /**
  * Waits for ALTCHA proof-of-work to finish.
- * ALTCHA sets widget.value to the encoded payload when done,
- * and the widget's `state` attribute becomes "verified".
+ * ALTCHA exposes state via the `state` attribute on the host element
+ * (no Shadow DOM access needed): "verifying" during PoW, "verified" when done.
  */
 async function waitForAltchaComplete(page, timeoutMs = 30000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
         try {
-            const done = await page.evaluate(() => {
-                const widget = document.querySelector('altcha-widget');
-                if (!widget) return false;
-                const state = widget.getAttribute('state');
-                if (state === 'verified') return true;
-                // Fallback: check hidden input value
-                const hidden = widget.shadowRoot && widget.shadowRoot.querySelector('input[type="hidden"]');
-                return hidden && hidden.value && hidden.value.length > 0;
+            const state = await page.evaluate(() => {
+                const w = document.querySelector('altcha-widget');
+                return w ? (w.getAttribute('state') || '') : '';
             });
-            if (done) return true;
+            if (state === 'verified') {
+                return true;
+            }
+            if (state && state !== '') {
+                process.stdout.write('\r   >> ALTCHA state: ' + state + '   ');
+            }
         } catch (e) {}
         await page.waitForTimeout(500);
     }
+    process.stdout.write('\n');
     return false;
 }
+
 
 (async () => {
     const users = getUsers();
